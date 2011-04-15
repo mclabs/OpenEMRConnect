@@ -24,10 +24,15 @@
  * ***** END LICENSE BLOCK ***** */
 package ke.go.moh.oec.lib;
 
-import ke.go.moh.oec.*;
+import java.io.IOException;
+import java.net.MalformedURLException;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import ke.go.moh.oec.IService;
 import java.io.FileInputStream;
 import java.util.Date;
 import java.util.Properties;
+import ke.go.moh.oec.PersonRequest;
 
 /**
  * Mediator between OEC clients and services to forward requests
@@ -87,8 +92,6 @@ public class Mediator implements IService {
     private QueueManager queueManager;
     /** Instance to pack and unpack XML */
     private XmlPacker xmlPacker;
-    /** Instance to retrieve message types */
-    private MessageTypeRegistry messageTypeRegistry;
     /**
      * Reference to our caller's callbackObject that implements
      * {@link IService#getData(int, java.lang.Object)}.
@@ -100,13 +103,16 @@ public class Mediator implements IService {
     static Properties properties = null;
 
     public Mediator() {
-        messageTypeRegistry = new MessageTypeRegistry();
         httpService = new HttpService(this);
         queueManager = new QueueManager(httpService);
         xmlPacker = new XmlPacker();
-        httpService.start();
+        try {
+            httpService.start();
+        } catch (IOException ex) {
+            Logger.getLogger(Mediator.class.getName()).log(Level.SEVERE, null, ex);
+        }
         queueManager.start();
-        Logger.info(Mediator.class.getName(), "OpenEMRConnect library services started.");
+        Logger.getLogger(Mediator.class.getName()).log(Level.INFO, "OpenEMRConnect library services started.");
     }
 
     /**
@@ -118,9 +124,13 @@ public class Mediator implements IService {
      * Call this method last, after you are through using the services.
      */
     public void stop() {
-        Logger.info(Mediator.class.getName(), "OpenEMRConnect library services stopped.");
+        Logger.getLogger(Mediator.class.getName()).log(Level.INFO, "OpenEMRConnect library services stopped.");
         queueManager.stop();
-        httpService.stop();
+        try {
+            httpService.stop();
+        } catch (IOException ex) {
+            Logger.getLogger(Mediator.class.getName()).log(Level.SEVERE, null, ex);
+        }
     }
 
     /**
@@ -140,8 +150,8 @@ public class Mediator implements IService {
                  * We somehow failed to open our default propoerties file.
                  * This should not happen. It should always be there.
                  */
-                Logger.error(Mediator.class.getName(),
-                        "getProperty() Can't open '" + propertiesFileName + "'");
+                Logger.getLogger(Mediator.class.getName()).log(Level.SEVERE,
+                        "getProperty() Can''t open ''{0}''", propertiesFileName);
             }
         }
         return properties.getProperty(propertyName);
@@ -182,38 +192,52 @@ public class Mediator implements IService {
      * @return object containing response data resulting from the request, or null if none
      */
     public Object getData(int requestTypeId, Object requestData) {
+		Message m = new Message();
+		m.setData(requestData);
+		
         /*
          * Determine the Type of message we are to send.
          */
-        MessageType messageType = messageTypeRegistry.find(requestTypeId);
+        MessageType messageType = MessageTypeRegistry.find(requestTypeId);
+		m.setMessageType(messageType);
         if (messageType == null) {
             /*
              * This is most likely an error on the part of our caller. We were
              * called with a request type ID that is not found as a request
              * in our MessageType list.
              */
-            Logger.error(Mediator.class.getName(), "getData() - Message type not found for Request type ID '" + requestTypeId + "'");
+                Logger.getLogger(Mediator.class.getName()).log(Level.SEVERE,
+                        "getData() - Message type not found for Request type ID ''{0}''", requestTypeId);
             return null;
         }
         /*
-         * Find the destination name.
+         * Find the destination address and name. This is usually the default
+         * destination for the message type. However if our caller is passing
+		 * us <code>PersonRequest</code> data, they may choose to explicitly
+		 * specify the destination rather than leaving it to the default.
          */
-        String destination = messageType.getDefaultDestination();
-        if (requestTypeId == RequestTypeId.SET_CLINICAL_DOCUMENT) {
-            destination = getClinicalDestination((Person) requestData);
-            if (destination.length() == 0) {
-                return null;        // No error - set Clinical Document but person is not a known patient at a clinic.
+        m.setDestinationAddress(messageType.getDefaultDestinationAddress());
+        m.setDestinationName(messageType.getDefaultDestinationName());
+		if (requestData.getClass() == PersonRequest.class) {
+            PersonRequest pr = (PersonRequest)requestData;
+            if (pr.getDestinationAddress() != null) {
+                m.setDestinationAddress(pr.getDestinationAddress());
+            }
+            if (pr.getDestinationName() != null) {
+                m.setDestinationName(pr.getDestinationName());
             }
         }
         Object returnData = null;
-        if (destination == null) {
-            Logger.error(Mediator.class.getName(), "getData() - Destination not found for Request type '" + messageType.getRequestTypeId() + "'");
+        if (m.getDestinationAddress() == null) {
+            Logger.getLogger(Mediator.class.getName()).log(Level.SEVERE,
+                    "getData() - Destination not found for Request type ''{0}''",
+                    messageType.getRequestTypeId());
         } else {
             /*
              * Generate a new request ID, and send the request to the server.
              */
             String messageId = generateMessageId();
-            returnData = sendData(messageType, requestData, messageId, destination);
+            returnData = sendData(m);
         }
         return returnData;
     }
@@ -252,48 +276,42 @@ public class Mediator implements IService {
      * the server. The server has given us back a response. And now we need to pack
      * up the response and return it to the client.
      *
-     * @param messageType the type of message we are sending. (Could be a request or a response message.)
-     * @param data the Object containing the data to send.
-     * @param messageId an identifier for the message we are to send.
-     * In the case of a new client request, this is a newly-generated message ID.
-     * In the case of a server response to a request, this is the original
-     * message ID from the request.
-     * @param destination the name of where to send this data. In the case
-     * of a server response to a request, this is name of the sender who
-     * originally made the request.
+     * @param m message to be sent
      * @return object containing response data from the request
      */
-    private Object sendData(MessageType messageType, Object data, String messageId, String destination) {
-        String ipAddressPort = getIpAddressPort(destination);
+    private Object sendData(Message m) {
+		MessageType messageType = m.getMessageType(); // For handy reference.
+        String ipAddressPort = getIpAddressPort(m.getDestinationAddress());
         if (ipAddressPort == null) {
             /*
              * This is an error in our routing mechanism. We have a desination
              * address, but we were unable to translate it into an IP address
              * and port number combination.
              */
-            Logger.error(Mediator.class.getName(), "getData() - Routing address not found for '" + destination + "'");
+                Logger.getLogger(Mediator.class.getName()).log(Level.SEVERE,
+                        "getData() - Routing address not found for ''{0}''", m.getDestinationAddress());
             return null;
         }
         /*
          * Pack the data into the XML message.
          */
-        String message = xmlPacker.pack(messageType, data, messageId);
+        String xml = xmlPacker.pack(m);
         /*
          * If we may get a response to this message, add it to the list of responses we are expecting.
          */
         if (messageType.getResponseMessageType() != null) {
-            registerRequest(messageType, messageId);
+            registerRequest(m);
         }
         /*
          * Send the message.
          */
-        sendMessage(message, ipAddressPort, destination, 1, messageType.isToBeQueued());
+        sendMessage(xml, ipAddressPort, m.getDestinationAddress(), 1, messageType.isToBeQueued());
         /*
          * If we expect a response to this message, wait for the response.
          */
         Object returnData = null;
         if (messageType.getResponseMessageType() != null) {
-            returnData = waitForResponse(messageType, messageId);
+            returnData = waitForResponse(m);
         }
         /*
          * Return.
@@ -303,11 +321,10 @@ public class Mediator implements IService {
 
     /**
      * Adds this message to a list of messages for which we expect a response.
-     * @param messageType type of request message we are expecting a response to
-     * @param messageId id of the message we are expecting a response to
+     * @param m message we are expecting a response to
      */
-    private synchronized void registerRequest(MessageType messageType, String messageId) {
-        throw new UnsupportedOperationException();
+    private synchronized void registerRequest(Message m) {
+        //TO DO: Write the contents
     }
 
     /**
@@ -315,11 +332,10 @@ public class Mediator implements IService {
      * response, return it to our caller. If there is no response message
      * after a defined timeout period, return null.
      *
-     * @param MessageType type of request message we are waiting for a response to.
-     * @param messageId id of the message we are expecting a response to
+     * @param m message we are waiting for a response to
      * @return data object to return to our caller, or null if timed out.
      */
-    private Object waitForResponse(MessageType messageType, String messageId) {
+    private Object waitForResponse(Message m) {
         throw new UnsupportedOperationException();
     }
 
@@ -395,7 +411,7 @@ public class Mediator implements IService {
      * @param hopCount the forwarding hop count (from the URL)
      * @param storeAndForward the indicator of whether this message should be stored and forwarded (from the URL)
      */
-    protected void processReceivedMessage(String message, String destination, int hopCount, boolean toBeQueued) {
+    protected void processReceivedMessage(String xml, String destination, int hopCount, boolean toBeQueued) {
         String ourInstanceAddress = getProperty("Instance.Address");
         String ipAddressPort = getIpAddressPort(destination);
         if (destination.equals(ourInstanceAddress)) { // If the message is addressed to us:
@@ -405,15 +421,16 @@ public class Mediator implements IService {
                  * and we do not find a different IP address/port for the
                  * message destination. It is really destined for us. Process it.
                  */
-                processLocalMessage(message);
+                processLocalMessage(xml);
             } else {
                 /*
                  * The message destination matches our own instance address
                  * but the router has returned a IP address/port for the
                  * destination that is not us. Somehing funny is happening.
                  */
-                Logger.error(Mediator.class.getName(), "Message destination '" + destination
-                        + "' matches our own name, but router returns IP Address/port of '" + ipAddressPort + "'");
+                Logger.getLogger(Mediator.class.getName()).log(Level.SEVERE,
+                        "Message destination ''{0}'' matches our own name, but router returns IP Address/port of ''{1}''",
+                        new Object[]{destination, ipAddressPort});
             }
         } else {    // If the message is not addressed to us:
             if (ipAddressPort == null) {
@@ -421,8 +438,9 @@ public class Mediator implements IService {
                  * The message destination does not match our own,
                  * and the router is not giving us an IP Port/Address for it.
                  */
-                Logger.error(Mediator.class.getName(), "IP Address/port not found for message with destination '"
-                        + destination + "', our instance address is '" + ourInstanceAddress + "'");
+                Logger.getLogger(Mediator.class.getName()).log(Level.SEVERE,
+                        "IP Address/port not found for message with destination ''{0}'', our instance address is ''{1}''",
+                        new Object[]{destination, ourInstanceAddress});
             } else {
                 /*
                  * The message destination does not match our own,
@@ -430,7 +448,7 @@ public class Mediator implements IService {
                  * It is not destined for us, so we will pass it though
                  * to its destination.
                  */
-                sendMessage(message, ipAddressPort, destination, hopCount + 1, toBeQueued);
+                sendMessage(xml, ipAddressPort, destination, hopCount + 1, toBeQueued);
             }
         }
     }
@@ -439,9 +457,9 @@ public class Mediator implements IService {
      * Process a HTTP message that is destined for us. We have already determined that it
      * is not a message that we are just routing through to somewhere else.
      * 
-     * @param message the message received from the HTTP listener.
+     * @param xml the message received from the HTTP listener.
      */
-    private void processLocalMessage(String message) {
+    private void processLocalMessage(String xml) {
         /*
          * Unpack the XML message.
          *
@@ -449,10 +467,10 @@ public class Mediator implements IService {
          * If so, deliver it. If not, process this as an unsolicited message.
          *
          */
-        UnpackedMessage unpackedMessage = xmlPacker.unpack(message);
-        boolean responseDelivered = deliverResponse(unpackedMessage);
+        Message m = xmlPacker.unpack(xml);
+        boolean responseDelivered = deliverResponse(m);
         if (!responseDelivered) { // Was the message a response to a request that we just delivered?
-            processUnsolicitedMessage(unpackedMessage);
+            processUnsolicitedMessage(m);
         }
     }
 
@@ -464,11 +482,11 @@ public class Mediator implements IService {
      * <p>
      * Otherwise, indicate that we were not waiting for this message.
      *
-     * @param unpackedMessage the unpacked message information.
+     * @param m the unpacked message information.
      * @return true if we were waiting for the message and it was delivered,
      * otherwise false.
      */
-    private synchronized boolean deliverResponse(UnpackedMessage unpackedMessage) {
+    private synchronized boolean deliverResponse(Message m) {
         throw new UnsupportedOperationException();
     }
 
@@ -481,8 +499,8 @@ public class Mediator implements IService {
      * @param requestID requestID found in the message we received.
      * @param source message address where the message came from.
      */
-    private void processUnsolicitedMessage(UnpackedMessage unpackedMessage) {
-        MessageType messageType = unpackedMessage.getMessageType(); // For convenience below (code readability).
+    private void processUnsolicitedMessage(Message m) {
+        MessageType messageType = m.getMessageType(); // For convenience below (code readability).
         if (messageType.getRequestTypeId() != 0) { // Does this message have a request ID?
             if (myCallbackObject != null) { // Yes. Did the user register a callback routine?
                 /*
@@ -491,11 +509,16 @@ public class Mediator implements IService {
                  * Then see if any response is returned.
                  * If a response is returned, and it is expected, deliver the response back to the original requesting source.
                  */
-                Object responseData = myCallbackObject.getData(messageType.getRequestTypeId(), unpackedMessage.getReturnData());
+                Object responseData = myCallbackObject.getData(messageType.getRequestTypeId(), m.getData());
                 if (responseData != null) {
                     if (messageType.getResponseMessageType() != null) {
-                        Object responseToResponseData = sendData(messageType.getResponseMessageType(), responseData,
-                                unpackedMessage.getMessageId(), unpackedMessage.getSource());
+						Message response = new Message();
+						response.setMessageType(messageType.getResponseMessageType());
+						response.setData(m.getMessageId());
+						response.setDestinationAddress(m.getSourceAddress());
+						response.setDestinationName(m.getSourceName());
+						response.setMessageId(m.getMessageId());
+                        Object responseToResponseData = sendData(response);
                         if (responseToResponseData != null) {
                             /*
                              * We have delivered a request to the server, and it has given us back a response.
@@ -503,16 +526,18 @@ public class Mediator implements IService {
                              * The requesting source has sent us back a message (a response to the response.)
                              * We did not expect this.
                              */
-                        Logger.warn(Mediator.class.getName(), "After returning a response to requestTypeId " + messageType.getRequestTypeId()
-                                + " from source '" + unpackedMessage.getSource() + "', the source returned more data back to us!");
+                Logger.getLogger(Mediator.class.getName()).log(Level.WARNING,
+                        "After returning a response to requestTypeId {0} from source ''{1}'', the source returned more data back to us!",
+                        new Object[]{messageType.getRequestTypeId(), m.getSourceAddress()});
                         }
                     } else {
                         /*
                          * This appears to be an error in our MessageType registry. We have a MessageType
                          * entry for the message we received, but there is no response message type.
                          */
-                        Logger.warn(Mediator.class.getName(), "Message type for requestTypeId " + messageType.getRequestTypeId()
-                                + " does not reference a return message type.");
+                        Logger.getLogger(Mediator.class.getName()).log(Level.WARNING,
+                                "Message type for requestTypeId {0} does not reference a return message type.",
+                                messageType.getRequestTypeId());
                     }
                 }
             } else {
@@ -521,8 +546,9 @@ public class Mediator implements IService {
                  * an unsolicited message -- at least a message that was not a reply we were
                  * waiting for.
                  */
-                Logger.warn(Mediator.class.getName(), "Unsolicited message with request type " + messageType.getRequestTypeId()
-                        + " received from '" + unpackedMessage.getSource() + "'. No user callback is registered.");
+                Logger.getLogger(Mediator.class.getName()).log(Level.WARNING,
+                        "Unsolicited message with request type {0} received from ''{1}''. No user callback is registered.",
+                        new Object[]{messageType.getRequestTypeId(), m.getSourceAddress()});
             }
         } else {
             /*
@@ -535,8 +561,9 @@ public class Mediator implements IService {
              *
              * Or this could be an error of some sort.
              */
-            Logger.warn(Mediator.class.getName(), "Unsolicited message with XML root '" + messageType.getRootXmlTag()
-                    + "' received from '" + unpackedMessage.getSource() + "', but it isn't registered as a request.");
+                Logger.getLogger(Mediator.class.getName()).log(Level.WARNING,
+                        "Unsolicited message with XML root ''{0}'' received from ''{1}'', but it isn''t registered as a request.",
+                        new Object[]{messageType.getRootXmlTag(), m.getSourceAddress()});
         }
     }
 
@@ -555,40 +582,31 @@ public class Mediator implements IService {
      * with our without the queueing mechanism for storing and forwarding.
      * Then we send it.
      * 
-     * @param message
-     * @param ipAddressPort
-     * @param destination
-     * @param hopCount
-     * @param storeAndForward
+     * @param xml the XML packed message to send
+     * @param ipAddressPort IP address and port to which to send the message
+     * @param destination ultimate destination address for this message
+     * @param hopCount how many times this message has been sent
+     * @param toBeQueued is this message to be queued for later if it can't be sent now?
      */
-    private void sendMessage(String message, String ipAddressPort, String destination, int hopCount, boolean toBeQueued) {
+    private void sendMessage(String xml, String ipAddressPort, String destination, int hopCount, boolean toBeQueued) {
         if (hopCount > MAX_HOP_COUNT) {
             /*
              * A message has been forwarded too many times, exceeding the maximum hop count.
              * This may indicate a routing loop between two or more systems.
              */
-            Logger.error(Mediator.class.getName(), "sendMessage() - Hop count " + hopCount
-                    + " exceeds maximum hop count " + MAX_HOP_COUNT
-                    + " for destination '" + destination
-                    + "', routed to '" + ipAddressPort + "'");
+            Logger.getLogger(Mediator.class.getName()).log(Level.SEVERE,
+                    "sendMessage() - Hop count {0} exceeds maximum hop count {1} for destination ''{2}'', routed to ''{3}''",
+                    new Object[]{hopCount, MAX_HOP_COUNT, destination, ipAddressPort});
         } else if (toBeQueued) {
-            queueManager.enqueue(message, ipAddressPort, destination, hopCount);
+            queueManager.enqueue(xml, ipAddressPort, destination, hopCount);
         } else {
-            httpService.send(message, ipAddressPort, destination, toBeQueued, hopCount); // (toBeQueued = false)
+            try {
+                httpService.send(xml, ipAddressPort, destination, toBeQueued, hopCount); // (toBeQueued = false)
+            } catch (MalformedURLException ex) {
+                Logger.getLogger(Mediator.class.getName()).log(Level.SEVERE, null, ex);
+            } catch (IOException ex) {
+                Logger.getLogger(Mediator.class.getName()).log(Level.SEVERE, null, ex);
+            }
         }
-    }
-
-    /**
-     * Finds the destination clinic at which the person has made the
-     * most recent regular visit (if any). This is used to know which
-     * clinic (if any) should receive any proactive notifications
-     * about the person.
-     * 
-     * @param person identity of the person we are looking for.
-     * @return the message address of the destination clinic,
-     * or null if the person has not had a regular visit at a clinic.
-     */
-    private String getClinicalDestination(Person person) {
-        throw new UnsupportedOperationException();
     }
 }
